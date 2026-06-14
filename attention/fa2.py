@@ -48,7 +48,7 @@ def _flash_attn_fwd_kernel(
         + offs_d[None, :] * stride_qd,
         mask=(offs_m[:, None] < n_q) & (offs_d[None, :] < head_dim),
         other=0.0,
-    )
+    ).to(tl.float16)
 
     m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     l_i = tl.zeros((BLOCK_M,), tl.float32)
@@ -65,7 +65,7 @@ def _flash_attn_fwd_kernel(
             + offs_d[None, :] * stride_kd,
             mask=(cols[:, None] < n_k) & (offs_d[None, :] < head_dim),
             other=0.0,
-        )
+        ).to(tl.float16)
         v = tl.load(
             v_ptr
             + pid_b * stride_vb
@@ -74,7 +74,7 @@ def _flash_attn_fwd_kernel(
             + offs_d[None, :] * stride_vd,
             mask=(cols[:, None] < n_k) & (offs_d[None, :] < head_dim),
             other=0.0,
-        )
+        ).to(tl.float16)
 
         qk = tl.dot(q, tl.trans(k)) * sm_scale
         qk = tl.where((offs_m[:, None] < n_q) & (cols[None, :] < n_k), qk, -float("inf"))
