@@ -114,7 +114,7 @@ def _sparse_attn_fwd_kernel(
     l_i = tl.zeros((BLOCK_M,), tl.float32)
     acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
 
-    for t in range(0, topk):
+    for t in tl.range(0, topk):
         block_id = tl.load(
             idx_ptr
             + pid_b * stride_ib

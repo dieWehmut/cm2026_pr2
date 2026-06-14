@@ -10,11 +10,11 @@ import math
 
 
 FA2_CONFIGS = [
-    triton.Config({'BLOCK_M': bm, 'BLOCK_N': bn}, num_stages=stages, num_warps=warps)
-    for bm in [64, 128]
-    for bn in [32, 64, 128]
-    for stages in [2, 3, 4]
-    for warps in [4, 8]
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=3, num_warps=8),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_stages=3, num_warps=4),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=3, num_warps=8),
 ]
 
 
@@ -22,10 +22,6 @@ FA2_CONFIGS = [
 @triton.jit
 def _flash_attn_fwd_kernel(
     q_ptr, k_ptr, v_ptr, o_ptr,
-    stride_qb: tl.constexpr, stride_qh: tl.constexpr, stride_qn: tl.constexpr, stride_qd: tl.constexpr,
-    stride_kb: tl.constexpr, stride_kh: tl.constexpr, stride_kn: tl.constexpr, stride_kd: tl.constexpr,
-    stride_vb: tl.constexpr, stride_vh: tl.constexpr, stride_vn: tl.constexpr, stride_vd: tl.constexpr,
-    stride_ob: tl.constexpr, stride_oh: tl.constexpr, stride_on: tl.constexpr, stride_od: tl.constexpr,
     n_q: tl.constexpr, n_k: tl.constexpr, head_dim: tl.constexpr,
     num_heads: tl.constexpr,
     sm_scale: tl.constexpr,
@@ -40,12 +36,15 @@ def _flash_attn_fwd_kernel(
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_D)
 
+    q_base = (pid_bh * n_q * head_dim).to(tl.int64)
+    k_base = (pid_bh * n_k * head_dim).to(tl.int64)
+    o_base = (pid_bh * n_q * head_dim).to(tl.int64)
+
     q = tl.load(
         q_ptr
-        + pid_b * stride_qb
-        + pid_h * stride_qh
-        + offs_m[:, None] * stride_qn
-        + offs_d[None, :] * stride_qd,
+        + q_base
+        + offs_m[:, None] * head_dim
+        + offs_d[None, :],
         mask=(offs_m[:, None] < n_q) & (offs_d[None, :] < head_dim),
         other=0.0,
     ).to(tl.float16)
@@ -59,19 +58,17 @@ def _flash_attn_fwd_kernel(
         cols = start_n + offs_n
         k = tl.load(
             k_ptr
-            + pid_b * stride_kb
-            + pid_h * stride_kh
-            + cols[:, None] * stride_kn
-            + offs_d[None, :] * stride_kd,
+            + k_base
+            + cols[:, None] * head_dim
+            + offs_d[None, :],
             mask=(cols[:, None] < n_k) & (offs_d[None, :] < head_dim),
             other=0.0,
         ).to(tl.float16)
         v = tl.load(
             v_ptr
-            + pid_b * stride_vb
-            + pid_h * stride_vh
-            + cols[:, None] * stride_vn
-            + offs_d[None, :] * stride_vd,
+            + k_base
+            + cols[:, None] * head_dim
+            + offs_d[None, :],
             mask=(cols[:, None] < n_k) & (offs_d[None, :] < head_dim),
             other=0.0,
         ).to(tl.float16)
@@ -93,10 +90,9 @@ def _flash_attn_fwd_kernel(
     acc = acc / tl.where(l_i > 0.0, l_i, 1.0)[:, None]
     tl.store(
         o_ptr
-        + pid_b * stride_ob
-        + pid_h * stride_oh
-        + offs_m[:, None] * stride_on
-        + offs_d[None, :] * stride_od,
+        + o_base
+        + offs_m[:, None] * head_dim
+        + offs_d[None, :],
         acc,
         mask=(offs_m[:, None] < n_q) & (offs_d[None, :] < head_dim),
     )
@@ -134,6 +130,9 @@ def flash_attention_2(q, k, v, attn_mask=None, dropout_p=0.0, training=False):
     assert k.shape == (B, H, Nk, D)
     assert v.shape == (B, H, Nk, D)
 
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
     out = torch.empty((B, H, Nq, D), device=q.device, dtype=v.dtype)
     block_d = _next_power_of_2(D)
     if block_d < 16:
@@ -144,10 +143,6 @@ def flash_attention_2(q, k, v, attn_mask=None, dropout_p=0.0, training=False):
 
     _flash_attn_fwd_kernel[grid](
         q, k, v, out,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         Nq, Nk, D, H, sm_scale,
         BLOCK_D=block_d,
     )
