@@ -153,7 +153,7 @@ def _sparse_int8_attn_fwd_kernel(
             other=0.0,
         )
 
-        qk = tl.dot(q, tl.trans(k)).to(tl.float32) * (q_scale * k_scale)
+        qk = tl.dot(q, tl.trans(k), out_dtype=tl.int32).to(tl.float32) * (q_scale * k_scale)
         qk = tl.where((offs_m[:, None] < n_q) & (cols[None, :] < n_k), qk, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -162,7 +162,7 @@ def _sparse_int8_attn_fwd_kernel(
         alpha = tl.exp2(m_i - m_new)
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
-        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v, out_dtype=tl.float32)
         m_i = m_new
         l_i = l_new
 
