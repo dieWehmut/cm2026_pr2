@@ -88,6 +88,7 @@ def _sparse_int8_attn_fwd_kernel(
     stride_ob: tl.constexpr, stride_oh: tl.constexpr, stride_on: tl.constexpr, stride_od: tl.constexpr,
     n_q: tl.constexpr, n_k: tl.constexpr, head_dim: tl.constexpr,
     num_heads: tl.constexpr, topk: tl.constexpr,
+    USE_INT8_DOT: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     pid_q = tl.program_id(0)
@@ -153,7 +154,11 @@ def _sparse_int8_attn_fwd_kernel(
             other=0.0,
         )
 
-        qk = tl.dot(q, tl.trans(k), out_dtype=tl.int32).to(tl.float32) * (q_scale * k_scale)
+        if USE_INT8_DOT:
+            qk = tl.dot(q, tl.trans(k), out_dtype=tl.int32).to(tl.float32)
+        else:
+            qk = tl.dot(q.to(tl.float16), tl.trans(k).to(tl.float16), out_dtype=tl.float32)
+        qk = qk * (q_scale * k_scale)
         qk = tl.where((offs_m[:, None] < n_q) & (cols[None, :] < n_k), qk, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -234,6 +239,7 @@ def sparse_int8_attention(q, k, v, attn_mask=None, topk_ratio=0.5,
     )
 
     out = torch.empty((B, H, Nq, D), device=q.device, dtype=v.dtype)
+    use_int8_dot = torch.cuda.get_device_capability(q.device)[0] >= 8
     _sparse_int8_attn_fwd_kernel[(num_q_blocks, B * H)](
         q_int8, k_int8, q_scale, k_scale, v, block_indices, out,
         q_int8.stride(0), q_int8.stride(1), q_int8.stride(2), q_int8.stride(3),
@@ -243,7 +249,7 @@ def sparse_int8_attention(q, k, v, attn_mask=None, topk_ratio=0.5,
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         block_indices.stride(0), block_indices.stride(1), block_indices.stride(2), block_indices.stride(3),
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        Nq, Nk, D, H, block_indices.shape[-1],
+        Nq, Nk, D, H, block_indices.shape[-1], use_int8_dot,
         BLOCK_M=block_size, BLOCK_N=block_size, BLOCK_D=block_d,
         num_warps=num_warps,
         num_stages=3,
