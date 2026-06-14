@@ -9,6 +9,16 @@ import triton.language as tl
 import math
 
 
+FA2_CONFIGS = [
+    triton.Config({'BLOCK_M': bm, 'BLOCK_N': bn}, num_stages=stages, num_warps=warps)
+    for bm in [64, 128]
+    for bn in [32, 64, 128]
+    for stages in [2, 3, 4]
+    for warps in [4, 8]
+]
+
+
+@triton.autotune(configs=FA2_CONFIGS, key=["n_q", "n_k", "head_dim"])
 @triton.jit
 def _flash_attn_fwd_kernel(
     q_ptr, k_ptr, v_ptr, o_ptr,
@@ -44,7 +54,8 @@ def _flash_attn_fwd_kernel(
     l_i = tl.zeros((BLOCK_M,), tl.float32)
     acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
 
-    for start_n in range(0, n_k, BLOCK_N):
+    for start_n in tl.range(0, n_k, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
         cols = start_n + offs_n
         k = tl.load(
             k_ptr
@@ -74,7 +85,8 @@ def _flash_attn_fwd_kernel(
         alpha = tl.exp2(m_i - m_new)
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
-        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(tl.float16), v, acc)
         m_i = m_new
         l_i = l_new
 
@@ -123,15 +135,12 @@ def flash_attention_2(q, k, v, attn_mask=None, dropout_p=0.0, training=False):
     assert v.shape == (B, H, Nk, D)
 
     out = torch.empty((B, H, Nq, D), device=q.device, dtype=v.dtype)
-    block_m = 64
-    block_n = 64
     block_d = _next_power_of_2(D)
     if block_d < 16:
         block_d = 16
 
-    grid = (triton.cdiv(Nq, block_m), B * H)
+    grid = lambda META: (triton.cdiv(Nq, META["BLOCK_M"]), B * H)
     sm_scale = (1.0 / math.sqrt(D)) * 1.4426950408889634
-    num_warps = 4 if block_d <= 64 else 8
 
     _flash_attn_fwd_kernel[grid](
         q, k, v, out,
@@ -140,9 +149,7 @@ def flash_attention_2(q, k, v, attn_mask=None, dropout_p=0.0, training=False):
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         Nq, Nk, D, H, sm_scale,
-        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_D=block_d,
-        num_warps=num_warps,
-        num_stages=3,
+        BLOCK_D=block_d,
     )
 
     return out
