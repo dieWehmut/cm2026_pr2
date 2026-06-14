@@ -3,7 +3,6 @@ Vanilla Attention Implementation
 """
 
 import torch
-import torch.nn.functional as F
 
 
 def vanilla_attention(q, k, v, attn_mask=None, dropout_p=0.0, training=False):
@@ -21,4 +20,17 @@ def vanilla_attention(q, k, v, attn_mask=None, dropout_p=0.0, training=False):
     Returns:
         Output tensor, shape [B, num_heads, N, head_dim]
     """
-    raise NotImplementedError("Vanilla attention is not implemented yet.")
+    scale = q.shape[-1] ** -0.5
+    scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            scores = scores.masked_fill(~attn_mask, float("-inf"))
+        else:
+            scores = scores + attn_mask
+
+    attn = torch.softmax(scores, dim=-1)
+    if dropout_p and training:
+        attn = torch.dropout(attn, dropout_p, train=True)
+
+    return torch.matmul(attn.to(v.dtype), v)
