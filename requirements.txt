@@ -1,0 +1,52 @@
+# =============================================================================
+# 3dgen environment — cleaned dependency list
+# Python 3.12, CUDA 12.6, for PixArt-alpha T2I inference + Triton attention
+#
+# Install core deps with:
+#   pip install -r requirements.txt
+#
+# Notes:
+#  - torch/torchvision/triton are CUDA 12.6 builds (+cu126). Install from the
+#    appropriate index, e.g.:
+#      pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu126
+#  - The nvidia-* CUDA runtime wheels below are pulled in automatically by
+#    torch; they are listed only for exact reproduction and can be omitted.
+# =============================================================================
+
+# ---- Core deep learning ----
+torch==2.8.0
+torchvision==0.23.0
+triton==3.4.0
+
+# ---- Diffusion / model loading (PixArt) ----
+diffusers==0.38.0
+transformers==5.9.0
+tokenizers==0.22.2
+huggingface_hub==1.17.0
+safetensors==0.8.0rc0
+sentencepiece==0.2.1          # T5 tokenizer
+timm==1.0.27                  # vision_transformer Attention/Mlp blocks
+accelerate==1.13.0
+
+# ---- Numerics / utils used directly by the code ----
+numpy==2.4.4
+pillow==12.2.0
+einops==0.8.2
+tqdm==4.65.2
+ftfy==6.3.1                   # text cleaning in T5 embedder
+beautifulsoup4==4.14.3        # html caption cleaning in T5 embedder
+PyYAML==6.0.3
+
+# ---- Common transitive deps (kept for reproducibility) ----
+filelock==3.14.0
+fsspec==2026.4.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+mpmath==1.3.0
+networkx==3.6.1
+packaging==24.2
+regex==2026.5.9
+requests==2.28.2
+sympy==1.14.0
+typing_extensions==4.15.0
+
