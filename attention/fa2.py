@@ -3,96 +3,95 @@ Triton-based Flash Attention 2 implementation (forward only).
 Optimized for inference without backward pass.
 """
 
+import math
+
 import torch
 import triton
 import triton.language as tl
-import math
 
 
 FA2_CONFIGS = [
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=2, num_warps=4),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=2, num_warps=4),
     triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=3, num_warps=8),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_stages=3, num_warps=4),
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=3, num_warps=8),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=2, num_warps=4),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=2, num_warps=4),
 ]
 
 
-@triton.autotune(configs=FA2_CONFIGS, key=["n_q", "n_k", "head_dim"])
+@triton.jit
+def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
+    if isinstance(desc_or_ptr, tl.tensor_descriptor):
+        return desc_or_ptr
+    return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
+
+
+@triton.autotune(configs=FA2_CONFIGS, key=["n_q", "head_dim"])
 @triton.jit
 def _flash_attn_fwd_kernel(
     q_ptr, k_ptr, v_ptr, o_ptr,
-    n_q: tl.constexpr, n_k: tl.constexpr, head_dim: tl.constexpr,
-    num_heads: tl.constexpr,
-    sm_scale: tl.constexpr,
-    EVEN: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    sm_scale,
+    n_q: tl.constexpr, n_k: tl.constexpr, batch: tl.constexpr, num_heads: tl.constexpr,
+    head_dim: tl.constexpr, block_d: tl.constexpr, out_dtype: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_bh = tl.program_id(1)
-    pid_b = pid_bh // num_heads
-    pid_h = pid_bh - pid_b * num_heads
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_D)
+    y_q_dim = batch * num_heads * n_q
+    y_k_dim = batch * num_heads * n_k
 
-    q_base = (pid_bh * n_q * head_dim).to(tl.int64)
-    k_base = (pid_bh * n_k * head_dim).to(tl.int64)
-    o_base = (pid_bh * n_q * head_dim).to(tl.int64)
+    desc_q = _maybe_make_tensor_desc(
+        q_ptr,
+        shape=[y_q_dim, head_dim],
+        strides=[head_dim, 1],
+        block_shape=[BLOCK_M, block_d],
+    )
+    desc_k = _maybe_make_tensor_desc(
+        k_ptr,
+        shape=[y_k_dim, head_dim],
+        strides=[head_dim, 1],
+        block_shape=[BLOCK_N, block_d],
+    )
+    desc_v = _maybe_make_tensor_desc(
+        v_ptr,
+        shape=[y_k_dim, head_dim],
+        strides=[head_dim, 1],
+        block_shape=[BLOCK_N, block_d],
+    )
+    desc_o = _maybe_make_tensor_desc(
+        o_ptr,
+        shape=[y_q_dim, head_dim],
+        strides=[head_dim, 1],
+        block_shape=[BLOCK_M, block_d],
+    )
 
-    q_ptrs = q_ptr + q_base + offs_m[:, None] * head_dim + offs_d[None, :]
-    if EVEN:
-        q = tl.load(q_ptrs).to(tl.float16)
-    else:
-        q = tl.load(
-            q_ptrs,
-            mask=(offs_m[:, None] < n_q) & (offs_d[None, :] < head_dim),
-            other=0.0,
-        ).to(tl.float16)
+    q_offset_y = pid_bh * n_q
+    k_offset_y = pid_bh * n_k
+    q_start_m = pid_m * BLOCK_M
+    q = desc_q.load([q_offset_y + q_start_m, 0])
 
-    m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
-    l_i = tl.zeros((BLOCK_M,), tl.float32)
-    acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+    m_i = tl.zeros((BLOCK_M,), tl.float32) - float("inf")
+    l_i = tl.zeros((BLOCK_M,), tl.float32) + 1.0
+    acc = tl.zeros((BLOCK_M, block_d), tl.float32)
+    qk_scale = sm_scale * 1.4426950408889634
 
     for start_n in tl.range(0, n_k, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        cols = start_n + offs_n
-        kv_ptrs = k_base + cols[:, None] * head_dim + offs_d[None, :]
-        if EVEN:
-            k = tl.load(k_ptr + kv_ptrs).to(tl.float16)
-            v = tl.load(v_ptr + kv_ptrs).to(tl.float16)
-        else:
-            block_mask = (cols[:, None] < n_k) & (offs_d[None, :] < head_dim)
-            k = tl.load(k_ptr + kv_ptrs, mask=block_mask, other=0.0).to(tl.float16)
-            v = tl.load(v_ptr + kv_ptrs, mask=block_mask, other=0.0).to(tl.float16)
-
-        qk = tl.dot(q, tl.trans(k)) * sm_scale
-        if not EVEN:
-            qk = tl.where((offs_m[:, None] < n_q) & (cols[None, :] < n_k), qk, -float("inf"))
-
-        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
-        if not EVEN:
-            m_new = tl.where(offs_m < n_q, m_new, 0.0)
-        p = tl.exp2(qk - m_new[:, None])
-        alpha = tl.exp2(m_i - m_new)
-        l_new = l_i * alpha + tl.sum(p, axis=1)
-
+        k = desc_k.load([k_offset_y + start_n, 0]).T
+        qk = tl.dot(q, k)
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+        qk = qk * qk_scale - m_ij[:, None]
+        p = tl.math.exp2(qk)
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + tl.sum(p, 1)
         acc = acc * alpha[:, None]
+        v = desc_v.load([k_offset_y + start_n, 0])
         acc = tl.dot(p.to(tl.float16), v, acc)
-        m_i = m_new
-        l_i = l_new
+        m_i = m_ij
 
-    acc = acc / tl.where(l_i > 0.0, l_i, 1.0)[:, None]
-    o_ptrs = o_ptr + o_base + offs_m[:, None] * head_dim + offs_d[None, :]
-    if EVEN:
-        tl.store(o_ptrs, acc)
-    else:
-        tl.store(
-            o_ptrs,
-            acc,
-            mask=(offs_m[:, None] < n_q) & (offs_d[None, :] < head_dim),
-        )
+    acc = acc / l_i[:, None]
+    desc_o.store([q_offset_y + q_start_m, 0], acc.to(out_dtype))
 
 
 def _next_power_of_2(x):
@@ -127,23 +126,31 @@ def flash_attention_2(q, k, v, attn_mask=None, dropout_p=0.0, training=False):
     assert k.shape == (B, H, Nk, D)
     assert v.shape == (B, H, Nk, D)
 
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-    out = torch.empty((B, H, Nq, D), device=q.device, dtype=v.dtype)
+    q = q.contiguous().reshape(B * H * Nq, D)
+    k = k.contiguous().reshape(B * H * Nk, D)
+    v = v.contiguous().reshape(B * H * Nk, D)
+    out = torch.empty((B * H * Nq, D), device=q.device, dtype=v.dtype)
+
     block_d = _next_power_of_2(D)
     if block_d < 16:
         block_d = 16
 
+    out_dtype = {
+        torch.float16: tl.float16,
+        torch.bfloat16: tl.bfloat16,
+        torch.float32: tl.float32,
+    }.get(v.dtype, tl.float16)
+
     grid = lambda META: (triton.cdiv(Nq, META["BLOCK_M"]), B * H)
-    sm_scale = (1.0 / math.sqrt(D)) * 1.4426950408889634
-    even = (Nq % 128 == 0) and (Nk % 128 == 0) and (D == block_d)
+    sm_scale = 1.0 / math.sqrt(D)
 
     _flash_attn_fwd_kernel[grid](
         q, k, v, out,
-        Nq, Nk, D, H, sm_scale, even,
-        BLOCK_D=block_d,
+        sm_scale,
+        Nq, Nk, B, H,
+        D,
+        block_d,
+        out_dtype,
     )
 
-    return out
-
+    return out.view(B, H, Nq, D)
