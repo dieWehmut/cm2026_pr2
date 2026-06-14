@@ -25,6 +25,7 @@ def _flash_attn_fwd_kernel(
     n_q: tl.constexpr, n_k: tl.constexpr, head_dim: tl.constexpr,
     num_heads: tl.constexpr,
     sm_scale: tl.constexpr,
+    EVEN: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -40,14 +41,15 @@ def _flash_attn_fwd_kernel(
     k_base = (pid_bh * n_k * head_dim).to(tl.int64)
     o_base = (pid_bh * n_q * head_dim).to(tl.int64)
 
-    q = tl.load(
-        q_ptr
-        + q_base
-        + offs_m[:, None] * head_dim
-        + offs_d[None, :],
-        mask=(offs_m[:, None] < n_q) & (offs_d[None, :] < head_dim),
-        other=0.0,
-    ).to(tl.float16)
+    q_ptrs = q_ptr + q_base + offs_m[:, None] * head_dim + offs_d[None, :]
+    if EVEN:
+        q = tl.load(q_ptrs).to(tl.float16)
+    else:
+        q = tl.load(
+            q_ptrs,
+            mask=(offs_m[:, None] < n_q) & (offs_d[None, :] < head_dim),
+            other=0.0,
+        ).to(tl.float16)
 
     m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     l_i = tl.zeros((BLOCK_M,), tl.float32)
@@ -56,28 +58,22 @@ def _flash_attn_fwd_kernel(
     for start_n in tl.range(0, n_k, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         cols = start_n + offs_n
-        k = tl.load(
-            k_ptr
-            + k_base
-            + cols[:, None] * head_dim
-            + offs_d[None, :],
-            mask=(cols[:, None] < n_k) & (offs_d[None, :] < head_dim),
-            other=0.0,
-        ).to(tl.float16)
-        v = tl.load(
-            v_ptr
-            + k_base
-            + cols[:, None] * head_dim
-            + offs_d[None, :],
-            mask=(cols[:, None] < n_k) & (offs_d[None, :] < head_dim),
-            other=0.0,
-        ).to(tl.float16)
+        kv_ptrs = k_base + cols[:, None] * head_dim + offs_d[None, :]
+        if EVEN:
+            k = tl.load(k_ptr + kv_ptrs).to(tl.float16)
+            v = tl.load(v_ptr + kv_ptrs).to(tl.float16)
+        else:
+            block_mask = (cols[:, None] < n_k) & (offs_d[None, :] < head_dim)
+            k = tl.load(k_ptr + kv_ptrs, mask=block_mask, other=0.0).to(tl.float16)
+            v = tl.load(v_ptr + kv_ptrs, mask=block_mask, other=0.0).to(tl.float16)
 
         qk = tl.dot(q, tl.trans(k)) * sm_scale
-        qk = tl.where((offs_m[:, None] < n_q) & (cols[None, :] < n_k), qk, -float("inf"))
+        if not EVEN:
+            qk = tl.where((offs_m[:, None] < n_q) & (cols[None, :] < n_k), qk, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
-        m_new = tl.where(offs_m < n_q, m_new, 0.0)
+        if not EVEN:
+            m_new = tl.where(offs_m < n_q, m_new, 0.0)
         p = tl.exp2(qk - m_new[:, None])
         alpha = tl.exp2(m_i - m_new)
         l_new = l_i * alpha + tl.sum(p, axis=1)
@@ -88,14 +84,15 @@ def _flash_attn_fwd_kernel(
         l_i = l_new
 
     acc = acc / tl.where(l_i > 0.0, l_i, 1.0)[:, None]
-    tl.store(
-        o_ptr
-        + o_base
-        + offs_m[:, None] * head_dim
-        + offs_d[None, :],
-        acc,
-        mask=(offs_m[:, None] < n_q) & (offs_d[None, :] < head_dim),
-    )
+    o_ptrs = o_ptr + o_base + offs_m[:, None] * head_dim + offs_d[None, :]
+    if EVEN:
+        tl.store(o_ptrs, acc)
+    else:
+        tl.store(
+            o_ptrs,
+            acc,
+            mask=(offs_m[:, None] < n_q) & (offs_d[None, :] < head_dim),
+        )
 
 
 def _next_power_of_2(x):
@@ -140,10 +137,11 @@ def flash_attention_2(q, k, v, attn_mask=None, dropout_p=0.0, training=False):
 
     grid = lambda META: (triton.cdiv(Nq, META["BLOCK_M"]), B * H)
     sm_scale = (1.0 / math.sqrt(D)) * 1.4426950408889634
+    even = (Nq % 128 == 0) and (Nk % 128 == 0) and (D == block_d)
 
     _flash_attn_fwd_kernel[grid](
         q, k, v, out,
-        Nq, Nk, D, H, sm_scale,
+        Nq, Nk, D, H, sm_scale, even,
         BLOCK_D=block_d,
     )
 
