@@ -10,13 +10,11 @@ import math
 
 
 FA2_CONFIGS = [
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=3, num_warps=4),
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=3, num_warps=4),
     triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
     triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=3, num_warps=8),
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=3, num_warps=4),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_stages=3, num_warps=4),
     triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=3, num_warps=8),
 ]
 
 
@@ -60,24 +58,16 @@ def _flash_attn_fwd_kernel(
     for start_n in tl.range(0, n_k, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         cols = start_n + offs_n
-        k_ptrs = k_ptr + k_base + offs_d[:, None] + cols[None, :] * head_dim
-        v_ptrs = v_ptr + k_base + cols[:, None] * head_dim + offs_d[None, :]
+        kv_ptrs = k_base + cols[:, None] * head_dim + offs_d[None, :]
         if EVEN:
-            k = tl.load(k_ptrs).to(tl.float16)
-            v = tl.load(v_ptrs).to(tl.float16)
+            k = tl.load(k_ptr + kv_ptrs).to(tl.float16)
+            v = tl.load(v_ptr + kv_ptrs).to(tl.float16)
         else:
-            k = tl.load(
-                k_ptrs,
-                mask=(offs_d[:, None] < head_dim) & (cols[None, :] < n_k),
-                other=0.0,
-            ).to(tl.float16)
-            v = tl.load(
-                v_ptrs,
-                mask=(cols[:, None] < n_k) & (offs_d[None, :] < head_dim),
-                other=0.0,
-            ).to(tl.float16)
+            block_mask = (cols[:, None] < n_k) & (offs_d[None, :] < head_dim)
+            k = tl.load(k_ptr + kv_ptrs, mask=block_mask, other=0.0).to(tl.float16)
+            v = tl.load(v_ptr + kv_ptrs, mask=block_mask, other=0.0).to(tl.float16)
 
-        qk = tl.dot(q, k) * sm_scale
+        qk = tl.dot(q, tl.trans(k)) * sm_scale
         if not EVEN:
             qk = tl.where((offs_m[:, None] < n_q) & (cols[None, :] < n_k), qk, -float("inf"))
 
