@@ -10,6 +10,8 @@ import triton
 import triton.language as tl
 import math
 
+from .fa2 import flash_attention_2
+
 
 def _next_power_of_2(x):
     return 1 << (x - 1).bit_length()
@@ -182,6 +184,9 @@ def sparse_attention(q, k, v, attn_mask=None, topk_ratio=0.5, block_size=64):
     Returns:
         Output tensor, shape [B, num_heads, N, head_dim]
     """
+    if attn_mask is None and float(topk_ratio) >= 1.0:
+        return flash_attention_2(q, k, v)
+
     block_indices = _make_block_indices(q, k, topk_ratio, block_size)
     if attn_mask is not None or not q.is_cuda:
         return _torch_sparse_attention(q, k, v, block_indices, block_size, attn_mask)
