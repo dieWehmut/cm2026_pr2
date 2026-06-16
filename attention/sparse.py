@@ -24,10 +24,6 @@ def _make_block_indices(q, k, topk_ratio, block_size):
     num_k_blocks = triton.cdiv(Nk, block_size)
     topk = max(1, min(num_k_blocks, int(num_k_blocks * float(topk_ratio))))
 
-    if topk >= num_k_blocks:
-        idx = torch.arange(num_k_blocks, device=q.device, dtype=torch.int32)
-        return idx.view(1, 1, 1, num_k_blocks).expand(B, H, num_q_blocks, num_k_blocks).contiguous()
-
     qf = q.float().contiguous()
     kf = k.float().contiguous()
     pad_q = num_q_blocks * block_size - Nq
@@ -184,9 +180,9 @@ def sparse_attention(q, k, v, attn_mask=None, topk_ratio=0.5, block_size=64):
     Returns:
         Output tensor, shape [B, num_heads, N, head_dim]
     """
-    if attn_mask is None and float(topk_ratio) >= 1.0:
-        return flash_attention_2(q, k, v)
-
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
     block_indices = _make_block_indices(q, k, topk_ratio, block_size)
     if attn_mask is not None or not q.is_cuda:
         return _torch_sparse_attention(q, k, v, block_indices, block_size, attn_mask)

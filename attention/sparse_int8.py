@@ -199,9 +199,14 @@ def sparse_int8_attention(q, k, v, attn_mask=None, topk_ratio=0.5,
     Returns:
         Output tensor, shape [B, num_heads, N, head_dim]
     """
-    block_indices = _make_block_indices(q, k, topk_ratio, block_size)
-    if attn_mask is not None or not q.is_cuda:
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    if not q.is_cuda:
+        block_indices = _make_block_indices(q, k, topk_ratio, block_size)
         return _torch_sparse_attention(q, k, v, block_indices, block_size, attn_mask)
+
+    block_indices = _make_block_indices(q, k, topk_ratio, block_size)
 
     B, H, Nq, D = q.shape
     Nk = k.shape[-2]
